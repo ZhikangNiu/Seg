@@ -35,3 +35,15 @@ class Metrics:
         macc *= 100
         return acc.cpu().numpy().round(2).tolist(), round(macc, 2)
 
+    def compute_Frequency_Weighted_Intersection_over_Union(self):
+        freq = torch.sum(self.hist, axis=1) / torch.sum(self.hist)
+        iu = torch.diag(self.hist) / (
+            torch.sum(self.hist, axis=1) + \
+            torch.sum(self.hist, axis=0) - \
+            torch.diag(self.hist)
+        )
+
+        FWIoU = (freq[freq > 0] * iu[freq > 0]).sum()
+        FWIoU = round(FWIoU.item(), 4)
+        return FWIoU
+
