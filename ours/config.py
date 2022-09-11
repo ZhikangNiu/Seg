@@ -7,8 +7,7 @@ import argparse
 
 
 def get_options(parser=argparse.ArgumentParser()):
-    parser.add_argument('--workers', type=int, default=4, help='number of data loading workers, you had better put it '
-                                                               '4 times of your gpu')
+    parser.add_argument('--workers', type=int, default=0, help='number of data loading workers, you had better put it 4 times of your gpu')
     parser.add_argument('--batch_size', type=int, default=16, help='input batch size, default=64')
     parser.add_argument('--data_root', type=str, default='/home/public/datasets/InternationalRaceTrackDataset/chusai_release/', help='...')
     parser.add_argument('--niter', type=int, default=100, help='number of epochs to train for, default=10')
