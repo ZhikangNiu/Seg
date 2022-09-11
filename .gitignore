@@ -245,7 +245,9 @@ out/
 
 # mpeltonen/sbt-idea plugin
 .idea_modules/
-
+remote-sense-quickstart/
+semantic-segmentation/
+mmsegmentation/
 # JIRA plugin
 atlassian-ide-plugin.xml
 
