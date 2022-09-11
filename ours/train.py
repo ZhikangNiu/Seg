@@ -10,6 +10,7 @@ from collections import OrderedDict
 warnings.filterwarnings("ignore")
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import optim
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data.distributed import DistributedSampler
@@ -21,10 +22,16 @@ from albumentations.pytorch.transforms import ToTensorV2
 import utils
 import config
 from torch.cuda.amp import autocast
-from models import PVTv2_SegFormer
-from losses import Dice,SegmentationLoss
+from models import PVTv2_Lawin
+from losses import compute_loss, DiceLoss
 from datasets import SegData
 from metrics import Metrics
+from torchvision.transforms import transforms
+from augmentations import Mixup_transmix
+
+from sklearn.model_selection import KFold
+
+
 
 # torch.autograd.set_detect_anomaly(True)
 torch.backends.cudnn.benchmark = True
@@ -41,42 +48,34 @@ random.seed(manual_seed)
 torch.manual_seed(manual_seed)
 
 
-# transform = {
-#     'image': A.Compose([
-#         A.HorizontalFlip(p=0.5),
-#         A.VerticalFlip(p=0.5),
-#         A.Normalize([0.24138375, 0.25477552, 0.29299292],
-#                     [0.09506353, 0.09248942, 0.09274331]),
-#         ToTensorV2(),
-#         ]),
-#     'label': A.Compose([
-#         A.HorizontalFlip(p=0.5),
-#         A.VerticalFlip(p=0.5),
-#         ToTensorV2()
-#         ]),
-# }
 
-train_dataset = SegData(opt.data_root, split='train', transform=None)
-train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
-# do not shuffle
-train_dataloader = dataloader.DataLoader(
-    dataset=train_dataset,
-    batch_size=opt.batch_size//4,
-    num_workers=opt.workers,
-    pin_memory=True,
-    shuffle=False,
-    sampler=train_sampler,
-    drop_last=True,
-)
+transform  = transforms.Compose([
+    transforms.RandomVerticalFlip(p=0.5),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomRotation(random.randint(-180, 180)),
+])
+
+train_dataset = SegData(opt.data_root, split='train', transform=transform)
+# train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+# # do not shuffle
+# train_dataloader = dataloader.DataLoader(
+#     dataset=train_dataset,
+#     batch_size=opt.batch_size//4,
+#     num_workers=opt.workers,
+#     pin_memory=True,
+#     shuffle=False,
+#     sampler=train_sampler,
+#     drop_last=True,
+# )
 
 
 length = len(train_dataset)
 
 # models init
-model = PVTv2_SegFormer('B1', 9,pretrained=opt.pretrained).cuda()
+model = PVTv2_Lawin('B4', 9, pretrained=opt.pretrained).cuda()
 
 if opt.resume:
-    state_dict = torch.load("./Best_PVTv2_SegFormer.pth")
+    state_dict = torch.load("./Best_PVTv2_Lawin.pth",map_location=torch.device("cpu"))
     new_state_dict = OrderedDict()
     for k, v in state_dict.items():
         name = k[7:]
@@ -84,67 +83,147 @@ if opt.resume:
     model.load_state_dict(new_state_dict)
     print("---------- load best pretrained model ----------")
 
+model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
 model = DistributedDataParallel(model, device_ids=[opt.local_rank], broadcast_buffers=False, find_unused_parameters=False)
 
-
 # criterion init
-#criterion = Dice()
-criterion = SegmentationLoss(cuda=opt.cuda).build_loss(mode='ce')
+blob_loss_dict = {
+    "main_weight": 2,
+    "blob_weight": 1,
+}
+criterion_dict = {
+    "ce": {
+        "name": "ce",
+        "loss": nn.CrossEntropyLoss(reduction="mean"),
+        "weight": 1.0,
+        "sigmoid": False,
+    },
+    "dice": {
+        "name": "dice",
+        "loss": DiceLoss(
+
+        ),
+        "weight": 1.0,
+        "sigmoid": False,
+    },
+}
+blob_criterion_dict = {
+    "bce": {
+        "name": "ce",
+        "loss": nn.CrossEntropyLoss(reduction="mean"),
+        "weight": 1.0,
+        "sigmoid": False,
+    },
+    "dice": {
+        "name": "dice",
+        "loss": DiceLoss(
+
+        ),
+        "weight": 1.0,
+        "sigmoid": False,
+    },
+}
+
 metric = Metrics(num_classes=9, ignore_label=-1, device="cuda")
 
+mixup_args = dict(
+    mixup_alpha=0.8, cutmix_alpha=1.0, cutmix_minmax=None,
+    prob=1.0, switch_prob=0.8, mode='batch',
+    label_smoothing=0.1, num_classes=9
+)
+mixup_fn = Mixup_transmix(**mixup_args)
+mixup_fn.mixup_enabled = True
+
 # optim and scheduler init
-model_optimizer = optim.AdamW(model.parameters(), lr=opt.lr, eps=1e-6, weight_decay=1e-4)
+params = [p for p in model.parameters() if p.requires_grad]
+model_optimizer = optim.Adam(params, lr=opt.lr, eps=1e-6, weight_decay=1e-4)
 model_scheduler = optim.lr_scheduler.CosineAnnealingLR(model_optimizer, T_max=opt.niter)
 
-# train model
 print("-----------------train-----------------")
-min_loss = 10000
-for epoch in range(opt.niter):
-    model.train()
-    epoch_losses = utils.AverageMeter()
-    epoch_iou = utils.AverageMeter()
-    epoch_f1 = utils.AverageMeter()
-    epoch_acc = utils.AverageMeter()
-    train_dataloader.sampler.set_epoch(epoch)
-    with tqdm(total=(length - length % opt.batch_size)) as t:
-        t.set_description('epoch: {}/{}'.format(epoch + 1, opt.niter))
+val_best_acc = 0
+kfold = KFold(n_splits=10,shuffle=True,random_state=42)
+for fold, (train_ids, test_ids) in enumerate(kfold.split(train_dataset)):
+    print(f'---------------Fold: {fold}-----------------')
+    # Sample elements randomly from a given list of ids, no replacement.
+    train_subsampler = torch.utils.data.SubsetRandomSampler(train_ids)
+    test_subsampler = torch.utils.data.SubsetRandomSampler(test_ids)
 
-        for record in train_dataloader:
+    # Define data loaders for training and testing data in this fold
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=opt.batch_size//4, sampler=train_subsampler)
+    val_dataloader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=1, sampler=test_subsampler)
 
-            inputs, labels = record
-            inputs = inputs.cuda(non_blocking=True)
-            labels = labels.cuda(non_blocking=True)
-            model_optimizer.zero_grad()
 
-            out = model(inputs)
-            loss = criterion(out, labels)
+    for epoch in range(opt.niter):
+        model.train()
+        epoch_losses = utils.AverageMeter()
+        epoch_iou = utils.AverageMeter()
+        epoch_f1 = utils.AverageMeter()
+        epoch_acc = utils.AverageMeter()
+        epoch_fwiou = utils.AverageMeter()
 
-            loss.backward()
-            # utils.clip_gradient(model_optimizer, 5)
+        with tqdm(total=(length - length % opt.batch_size)) as t:
+            t.set_description('epoch: {}/{}'.format(epoch + 1, opt.niter))
 
-            model_optimizer.step()
+            for record in train_dataloader:
+                inputs, labels = record
+                inputs = inputs.cuda(non_blocking=True)
+                labels = labels.cuda(non_blocking=True)
 
-            metric.update(out, labels)
-            _, iou = metric.compute_iou()
-            _, f1 = metric.compute_f1()
-            _, acc = metric.compute_pixel_acc()
+                inputs, labels_mix = mixup_fn(inputs, labels)
 
-            epoch_losses.update(loss.item(), opt.batch_size)
-            epoch_iou.update(iou, opt.batch_size)
-            epoch_f1.update(f1, opt.batch_size)
-            epoch_acc.update(acc, opt.batch_size)
+                model_optimizer.zero_grad()
 
-            t.set_postfix(
-                loss='{:.6f}'.format(epoch_losses.avg),
-                iou='{:.2f}'.format(epoch_iou.avg),
-                f1='{:.2f}'.format(epoch_f1.avg),
-                acc='{:.2f}'.format(epoch_acc.avg),
-            )
-            t.update(opt.batch_size)
+                out, attns = model(inputs)
 
-    model_scheduler.step()
-    if dist.get_rank() == 0 and loss.item()<min_loss:
-        torch.save(model.state_dict(), "./Best_PVTv2_SegFormer.pth")
+                for attn in attns:
+                    attn = torch.mean(attn[:, :, 0, :], dim=1)  # attn from cls_token to images
+                    labels_mix_calc_loss = mixup_fn.transmix_label(labels_mix, attn, inputs.shape)
+                    # print(labels_mix_calc_loss.shape)
+                    loss, _, _ = compute_loss(blob_loss_dict, criterion_dict, blob_criterion_dict, out, labels_mix_calc_loss, labels_mix_calc_loss)
+                    loss.sum().backward(retain_graph=True)
+
+                model_optimizer.step()
+
+                metric.update(out, labels)
+                _, iou = metric.compute_iou()
+                _, f1 = metric.compute_f1()
+                _, acc = metric.compute_pixel_acc()
+                fwiou = metric.compute_Frequency_Weighted_Intersection_over_Union()
+
+                epoch_losses.update(loss.sum().item(), opt.batch_size)
+                epoch_iou.update(iou, opt.batch_size)
+                epoch_f1.update(f1, opt.batch_size)
+                epoch_acc.update(acc, opt.batch_size)
+                epoch_fwiou.update(fwiou * 100, opt.batch_size)
+
+                t.set_postfix(
+                    loss='{:.6f}'.format(epoch_losses.avg),
+                    iou='{:.2f}'.format(epoch_iou.avg),
+                    f1='{:.2f}'.format(epoch_f1.avg),
+                    acc='{:.2f}'.format(epoch_acc.avg),
+                    fwiou='{:.2f}'.format(epoch_fwiou.avg),
+                )
+                t.update(opt.batch_size)
+
+        model_scheduler.step()
+
+
+        val_correct = 0.0
+        model.eval()
+        for images, labels in val_dataloader:
+            images, labels = images.cuda(), labels.cuda()
+            output,_ = model(images)
+            scores, predictions = torch.max(output.data, 1)
+            val_correct += (predictions == labels).sum().item()
+
+        val_acc = val_correct / len(test_ids)
+        print("Fold{}: Test Acc {:.2f} %".format(fold,val_correct / len(test_ids) * 100))
+        if val_correct / len(test_ids) > val_best_acc:
+            torch.save(model.state_dict(), "./{fold}-{epoch}-_PVTv2_Lawin.pth".format(fold,epoch))
 
 if dist.get_rank() == 0:
-    torch.save(model.state_dict(), "./Last_PVTv2_SegFormer.pth")
+    torch.save(model.state_dict(), "./Last_PVTv2_Lawin.pth")
