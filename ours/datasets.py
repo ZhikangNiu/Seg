@@ -6,6 +6,7 @@
 import os
 
 import torch
+import numpy as np
 from torch import Tensor
 from torch.utils.data import Dataset
 from torchvision import transforms
@@ -39,9 +40,12 @@ class SegData(Dataset):
                 transforms.Normalize([0.24138375, 0.25477552, 0.29299292],
                                      [0.09506353, 0.09248942, 0.09274331]),
             ])
+            # self.transform_label = transforms.Compose([
+            #     transforms.ToTensor(),
+            # ])
         else:
-            self.transform_image = transform['image']
-            self.transform_label = transform['label']
+            self.transform_image = transform
+            self.transform_label = transform
         self.n_classes = len(self.CLASSES)
         self.ignore_label = -1
 
@@ -59,11 +63,25 @@ class SegData(Dataset):
             img_path = str(self.img_files[index])
             lbl_path = img_path.replace('images', 'labels').replace('.tif', '.png')
             image = cv2.imread(img_path)
-            label = cv2.imread(lbl_path, 0)
+            label = Image.open(lbl_path)
 
             if self.transform is None:
                 image = self.transform_image(image)
-            label = torch.tensor(label)
+                label = np.array(label) / 100
+                label = torch.tensor(label)
+            else:
+                image = Image.fromarray(image)
+                image = self.transform_image(image)
+                label = self.transform_label(label)
+                pro_transform = transforms.Compose([
+                    transforms.ToTensor(),
+                    transforms.Normalize([0.24138375, 0.25477552, 0.29299292],
+                                         [0.09506353, 0.09248942, 0.09274331])
+                ])
+
+                image = pro_transform(image)
+                label = np.array(label) / 100
+                label = torch.tensor(label)
 
             return image, label.squeeze().long()
         else:
@@ -79,5 +97,7 @@ if __name__ == '__main__':
     for i, (image, label) in enumerate(dataloader):
         print(image.shape)
         print(label.shape)
+        print(label)
         print(label.max())
         print(label.min())
+
