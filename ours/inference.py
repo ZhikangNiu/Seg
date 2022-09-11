@@ -12,8 +12,11 @@ from datasets import SegData
 import cv2
 import numpy as np
 from torch.utils.data import dataloader
+from PIL import Image
+from ours.models import PVTv2_Lawin
+from tqdm import tqdm
+import ttach as tta
 
-from ours.models import PVTv2_SegFormer
 
 
 def load_state(self, conf, fixed_str, from_save_folder=False, model_only=False):
@@ -35,69 +38,52 @@ def load_state(self, conf, fixed_str, from_save_folder=False, model_only=False):
 
 def semantic2mask(mask,labels):
     # 语义图转标签图  labels代表所有的标签 [0, 100, 200, 300, 400, 500, 600, 700, 800]
-    x = np.argmax(mask, axis=1)+1
+    x = np.argmax(mask, axis=1)
     label_codes = np.array(labels)
     x = label_codes[x.astype(np.uint8)]
     return x
 
+
 @torch.no_grad()
 def generate_test():
 
-    output_dir = "./results"
+    output_dir = "./results/results"
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
-    model = PVTv2_SegFormer('B1', 9).cuda()
-    state_dict = torch.load("./Best_PVTv2_SegFormer.pth")
+    tta_transforms = tta.Compose(
+        [
+            tta.HorizontalFlip(),
+            tta.VerticalFlip(),
+            tta.Rotate90(angles=[0, 180]),
+            tta.Multiply(factors=[0.9, 1, 1.1]),
+        ]
+    )
+
+    model = PVTv2_Lawin('B4', 9).cuda("cuda:7")
+    state_dict = torch.load("./Best_PVTv2_Lawin.pth")
     new_state_dict = OrderedDict()
     for k, v in state_dict.items():
         name = k[7:]
         new_state_dict[name] = v
     model.load_state_dict(new_state_dict)
     model.eval()
+    model = tta.SegmentationTTAWrapper(model, tta.aliases.tta_transforms, merge_mode='mean')
 
-    labels = [0, 100, 200, 300, 400, 500, 600, 700, 800]
+    labels = [0, 1, 2, 3, 4, 5, 6, 7, 8]
 
     dataset = SegData(root="/home/public/datasets/InternationalRaceTrackDataset/chusai_release/",split="test")
+    test_loader = dataloader.DataLoader(dataset=dataset, pin_memory=True)
+    print("-----------------test-----------------")
+    for image ,name in tqdm(test_loader):
+        image = image.cuda("cuda:7")
+        output = model(image)
 
-    ################### debug ####################
-    img =cv2.imread("/home/public/datasets/InternationalRaceTrackDataset/chusai_release/testA/images/2.tif")
-    transform_image = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize([0.24138375, 0.25477552, 0.29299292],
-                             [0.09506353, 0.09248942, 0.09274331]),
-    ])
-    x = transform_image(img)
-    output = model(x.unsqueeze(0).cuda())
-    pred = torch.softmax(output, dim=1).cpu().detach().numpy()
-    x = np.argmax(pred, axis=1)
-    label_codes = np.array(labels)
-    x = label_codes[x.astype(np.uint8)]
-    print(output)
-    print(output.shape)
-    print(output.max())
-    print(output.min())
-    print(output.mean())
-    print(x)
-    print(x.max())
-    print(x.min())
-    print("-----------------")
-    label = cv2.imread("/home/public/datasets/InternationalRaceTrackDataset/chusai_release/train/labels/1.png",0)
-    print(label.shape)
-    print(label.max())
-    print(label)
-    #################### debug ####################
-
-    # test_loader = dataloader.DataLoader(dataset=dataset, pin_memory=True)
-    # print("-----------------test-----------------")
-    # for image ,name in test_loader:
-    #     image = image.cuda()
-    #     output = model(image)
-    #     pred = torch.softmax(output, dim=1).cpu().detach().numpy()
-    #     # pred -> [1, 9, 512, 512]
-    #     pred = semantic2mask(pred, labels=labels).squeeze().astype(np.uint16)
-    #     cv2.imwrite(os.path.join(output_dir, name[0].replace("tif","png")), pred)
-
+        pred = torch.softmax(output, dim=1).cpu().detach().numpy()
+        # pred -> [1, 9, 512, 512]
+        pred = semantic2mask(pred, labels=labels).squeeze().astype(np.uint8)
+        Image.fromarray(pred).save(os.path.join(output_dir, name[0]).replace("tif","png"))
+        #cv2.imwrite(os.path.join(output_dir, name[0].replace("tif","png")), pred)
 
 
 if __name__ == "__main__":
