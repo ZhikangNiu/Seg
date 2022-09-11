@@ -3,6 +3,7 @@
 # @Author  : Zhikang Niu
 # @FileName: train.py
 # @Software: PyCharm
+import logging
 import random
 import warnings
 from collections import OrderedDict
@@ -30,7 +31,6 @@ from torchvision.transforms import transforms
 from augmentations import Mixup_transmix
 
 from sklearn.model_selection import KFold
-
 
 
 # torch.autograd.set_detect_anomaly(True)
@@ -68,8 +68,21 @@ train_dataset = SegData(opt.data_root, split='train', transform=transform)
 #     drop_last=True,
 # )
 
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+file_handler = logging.FileHandler(f"train_PVTv2_Lawin_B4_bs{opt.batch_size}_lr{opt.lr}.log")
+formatter = logging.Formatter('%(asctime)s: %(levelname)s: [%(filename)s: %(lineno)d]: %(message)s')
+file_handler.setFormatter(formatter)
 
-length = len(train_dataset)
+# print to screen
+stream_handler = logging.StreamHandler()
+stream_handler.setLevel(logging.DEBUG)
+
+# add handlers to logger
+logger.addHandler(file_handler)
+logger.addHandler(stream_handler)
+
+
 
 # models init
 model = PVTv2_Lawin('B4', 9, pretrained=opt.pretrained).cuda()
@@ -156,6 +169,8 @@ for fold, (train_ids, test_ids) in enumerate(kfold.split(train_dataset)):
         train_dataset,
         batch_size=1, sampler=test_subsampler)
 
+    train_length = len(train_dataloader)
+    val_length = len(val_dataloader)
 
     for epoch in range(opt.niter):
         model.train()
@@ -165,7 +180,8 @@ for fold, (train_ids, test_ids) in enumerate(kfold.split(train_dataset)):
         epoch_acc = utils.AverageMeter()
         epoch_fwiou = utils.AverageMeter()
 
-        with tqdm(total=(length - length % opt.batch_size)) as t:
+
+        with tqdm(total=(train_length - train_length % opt.batch_size)) as t:
             t.set_description('epoch: {}/{}'.format(epoch + 1, opt.niter))
 
             for record in train_dataloader:
@@ -208,22 +224,33 @@ for fold, (train_ids, test_ids) in enumerate(kfold.split(train_dataset)):
                     fwiou='{:.2f}'.format(epoch_fwiou.avg),
                 )
                 t.update(opt.batch_size)
+            if dist.get_rank() == 0:
+                logger.info(f"Fold:{fold} \
+                            epoch:{epoch} \
+                            loss:{epoch_losses.avg} \
+                            iou:{epoch_iou.avg} \
+                            f1:{epoch_f1.avg} \
+                            acc:{epoch_acc.avg}")
 
         model_scheduler.step()
 
 
-        val_correct = 0.0
+
+        val_acc = utils.AverageMeter()
         model.eval()
-        for images, labels in val_dataloader:
+        for images, labels in tqdm(val_dataloader):
             images, labels = images.cuda(), labels.cuda()
             output,_ = model(images)
-            scores, predictions = torch.max(output.data, 1)
-            val_correct += (predictions == labels).sum().item()
+            metric.update(output, labels)
 
-        val_acc = val_correct / len(test_ids)
-        print("Fold{}: Test Acc {:.2f} %".format(fold,val_correct / len(test_ids) * 100))
-        if val_correct / len(test_ids) > val_best_acc:
-            torch.save(model.state_dict(), "./{fold}-{epoch}-_PVTv2_Lawin.pth".format(fold,epoch))
+            _, acc = metric.compute_pixel_acc()
+            val_acc.update(acc)
+        if dist.get_rank() == 0:
+            logger.info('val_acc: {:.2f}'.format(val_acc.avg))
+
+        if val_acc.avg > val_best_acc:
+            val_best_acc = val_acc.avg
+            torch.save(model.state_dict(), f"./PVTv2_Lawin_bs{opt.batch_size}_{fold}_{epoch}.pth")
 
 if dist.get_rank() == 0:
     torch.save(model.state_dict(), "./Last_PVTv2_Lawin.pth")
