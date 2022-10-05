@@ -167,7 +167,8 @@ class PVTv2(nn.Module):
             # print(attn4.shape)
         x4 = self.norm4(x).reshape(B, H, W, -1).permute(0, 3, 1, 2)
 
-        return (x1, x2, x3, x4), (attn1, attn2, attn3, attn4)
+        return x1, x2, x3, x4
+        # return (x1, x2, x3, x4), (attn1, attn2, attn3, attn4)
 
 
 class MLP_Head(nn.Module):
@@ -373,10 +374,10 @@ class PVTv2_Lawin(nn.Module):
         self.head =  LawinHead([64, 128, 320, 512], num_classes=num_classes)
 
     def forward(self, x):
-        out_feature, attn = self.backbone(x)
+        out_feature = self.backbone(x)
         out = self.head(out_feature)
         out = F.interpolate(out, size=x.shape[2:], mode='bilinear', align_corners=False)
-        return out, attn
+        return out
 
 
 if __name__ == '__main__':
@@ -392,6 +393,7 @@ if __name__ == '__main__':
     # print(new_state_dict.keys())
     # model.load_state_dict(new_state_dict, strict=False)
     x = torch.zeros(2, 3, 512, 512)
-    outs = model(x)[0]
+    outs = model(x)
+    print(outs.shape)
     for y in outs:
         print(y.shape)

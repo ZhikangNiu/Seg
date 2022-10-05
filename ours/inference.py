@@ -60,15 +60,15 @@ def generate_test():
         ]
     )
 
-    model = PVTv2_Lawin('B4', 9).cuda("cuda:7")
-    state_dict = torch.load("./Best_PVTv2_Lawin.pth")
+    model = PVTv2_Lawin('B1', 9).cuda("cuda:1")
+    state_dict = torch.load("./Best_PVTv2_B1_Lawin_bs32_8_1.pth")
     new_state_dict = OrderedDict()
     for k, v in state_dict.items():
         name = k[7:]
         new_state_dict[name] = v
     model.load_state_dict(new_state_dict)
     model.eval()
-    model = tta.SegmentationTTAWrapper(model, tta.aliases.tta_transforms, merge_mode='mean')
+    # model = tta.SegmentationTTAWrapper(model, tta_transforms, merge_mode='mean')
 
     labels = [0, 1, 2, 3, 4, 5, 6, 7, 8]
 
@@ -76,7 +76,7 @@ def generate_test():
     test_loader = dataloader.DataLoader(dataset=dataset, pin_memory=True)
     print("-----------------test-----------------")
     for image ,name in tqdm(test_loader):
-        image = image.cuda("cuda:7")
+        image = image.cuda("cuda:1")
         output = model(image)
 
         pred = torch.softmax(output, dim=1).cpu().detach().numpy()
