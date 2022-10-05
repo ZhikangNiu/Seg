@@ -33,19 +33,15 @@ class SegData(Dataset):
         super().__init__()
         assert split in ['train', 'test']
         self.split = 'testA' if split == 'test' else 'train'
-        self.transform = transform
-        if self.transform is None:
-            self.transform_image = transforms.Compose([
-                transforms.ToTensor(),
-                transforms.Normalize([0.24138375, 0.25477552, 0.29299292],
-                                     [0.09506353, 0.09248942, 0.09274331]),
-            ])
-            # self.transform_label = transforms.Compose([
-            #     transforms.ToTensor(),
-            # ])
-        else:
-            self.transform_image = transform
-            self.transform_label = transform
+
+        self.transform_image = transforms.Compose([
+            transforms.ToTensor(),
+            # transforms.Normalize([0.24138375, 0.25477552, 0.29299292],
+            #                      [0.09506353, 0.09248942, 0.09274331]),
+        ])
+        if transform is not None:
+            self.transform_aug = transform
+
         self.n_classes = len(self.CLASSES)
         self.ignore_label = -1
 
@@ -63,25 +59,16 @@ class SegData(Dataset):
             img_path = str(self.img_files[index])
             lbl_path = img_path.replace('images', 'labels').replace('.tif', '.png')
             image = cv2.imread(img_path)
+
             label = Image.open(lbl_path)
 
-            if self.transform is None:
-                image = self.transform_image(image)
-                label = np.array(label) / 100
-                label = torch.tensor(label)
-            else:
-                image = Image.fromarray(image)
-                image = self.transform_image(image)
-                label = self.transform_label(label)
-                pro_transform = transforms.Compose([
-                    transforms.ToTensor(),
-                    transforms.Normalize([0.24138375, 0.25477552, 0.29299292],
-                                         [0.09506353, 0.09248942, 0.09274331])
-                ])
+            image = self.transform_image(image)
+            label = np.array(label) / 100
+            label = torch.tensor(label)
 
-                image = pro_transform(image)
-                label = np.array(label) / 100
-                label = torch.tensor(label)
+            if hasattr(self, "transform_aug"):
+                image = self.transform_aug(image)
+                label = self.transform_aug(label)
 
             return image, label.squeeze().long()
         else:
@@ -96,8 +83,10 @@ if __name__ == '__main__':
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
     for i, (image, label) in enumerate(dataloader):
         print(image.shape)
-        print(label.shape)
-        print(label)
-        print(label.max())
-        print(label.min())
+        # print(image)
+        # print(label.shape)
+        # print(image)
+        # print(label)
+        # print(label.max())
+        # print(label.min())
 
